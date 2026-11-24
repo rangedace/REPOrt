@@ -7,7 +7,7 @@ using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
 
-[BepInPlugin("fr.rangedace.report", "REPOrt", "1.0.0")]
+[BepInPlugin("fr.rangedace.report", "REPOrt", "1.2.0")]
 public sealed class REPOrt : BaseUnityPlugin
 {
     static REPOrt mod;
@@ -28,7 +28,7 @@ public sealed class REPOrt : BaseUnityPlugin
     Vector2 scroll;
     string damage = "10", status = "";
     float nextScan, nextFreeze;
-    Rect window = new Rect(18,18,440,480);
+    Rect window = new Rect(18,18,520,500);
     static FieldInfo Field(Type type,string name) { return AccessTools.Field(type,name); }
     static readonly FieldInfo hp = Field(typeof(PlayerHealth),"health"), maximum = Field(typeof(PlayerHealth),"maxHealth"),
         enemyHp = Field(typeof(EnemyHealth),"healthCurrent"), enemyHealth = Field(typeof(Enemy),"Health"),
@@ -46,6 +46,9 @@ public sealed class REPOrt : BaseUnityPlugin
         fov = Config.Bind("Visuals","FOV",0,new ConfigDescription("0 = game default",new AcceptableValueRange<int>(0,140)));
         Bind("Visuals","Toggle ESP",false);
         foreach(var key in kinds) Bind("Visuals",key+" ESP",true);
+        foreach (string read in new[]{"KeyDown","KeyUp","KeyHold","GetScrollY"})
+            Prefix(typeof(InputManager),read,"AllowGameInput");
+        Prefix(typeof(UnityEngine.EventSystems.EventSystem),"Update","AllowGameInput");
         Prefix(typeof(PlayerHealth),"Hurt","IgnoreDamage");
         Prefix(typeof(PlayerTumble),"TumbleSet","IgnoreFall");
         Prefix(typeof(Enemy),"SetChaseTarget","Chase");
@@ -55,7 +58,25 @@ public sealed class REPOrt : BaseUnityPlugin
     {
         patches.Patch(AccessTools.Method(owner,method),new HarmonyMethod(typeof(REPOrt),handler));
     }
-    void OnDestroy() { if (gun) gun.numberOfBullets = originalBullets; patches.UnpatchSelf(); mod = null; }
+    bool waitForRelease;
+    CursorLockMode oldLock;
+    bool oldVisible;
+    static bool AllowGameInput() { return !mod || !(mod.open || mod.waitForRelease); }
+    void SetOpen(bool value)
+    {
+        if (value) {
+            oldLock = Cursor.lockState;
+            oldVisible = Cursor.visible;
+            Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+        } else {
+            Cursor.lockState = oldLock;
+            Cursor.visible = oldVisible;
+            waitForRelease = true;
+        }
+        open = value;
+    }
+    void OnDestroy() { if(open) SetOpen(false); foreach(var texture in palette) Destroy(texture); if (gun) gun.numberOfBullets = originalBullets; patches.UnpatchSelf(); mod = null; }
     static bool Local(Component c) { return PlayerAvatar.instance && c.GetComponentInParent<PlayerAvatar>() == PlayerAvatar.instance; }
     static bool IgnoreDamage(PlayerHealth __instance) { return !(mod.On("God Mode") && Local(__instance)); }
     static bool IgnoreFall(PlayerTumble __instance,bool __0) { return !(__0 && mod.On("No Tumble") && Local(__instance)); }
@@ -87,7 +108,8 @@ public sealed class REPOrt : BaseUnityPlugin
     }
     void Update()
     {
-        if (Input.GetKeyDown(KeyCode.F8)) open = !open;
+        if (waitForRelease && !Enumerable.Range(0,5).Any(i => Input.GetMouseButton(i) || Input.GetMouseButtonUp(i))) waitForRelease=false;
+        if (Input.GetKeyDown(KeyCode.F8)) SetOpen(!open);
         if (open && PlayerAvatar.instance) {
             SemiFunc.CursorUnlock(0.1f);
             SemiFunc.InputDisableAiming();
@@ -96,12 +118,20 @@ public sealed class REPOrt : BaseUnityPlugin
         SelfUpdate();
         if ((open || On("Toggle ESP")) && Time.unscaledTime >= nextScan) {
             nextScan = Time.unscaledTime + 0.65f;
+            enemyMeshes.Clear();
             for(int i=0;i<types.Length;i++) {
                 objects[i].Clear();
                 var seen = new HashSet<GameObject>();
                 foreach(var type in types[i])
                     foreach(Component c in UnityEngine.Object.FindObjectsByType(type,FindObjectsSortMode.None))
-                        if(seen.Add(c.gameObject)) objects[i].Add(c);
+                        if(seen.Add(c.gameObject)) {
+                            objects[i].Add(c);
+                            var enemy=c as Enemy;
+                            if(enemy) {
+                                var parent=enemy.GetComponentInParent<EnemyParent>();
+                                enemyMeshes[enemy]=(parent ? parent.gameObject : enemy.gameObject).GetComponentsInChildren<Renderer>(true);
+                            }
+                        }
             }
         }
         if (frozen.Count>0 && Time.time >= nextFreeze) {
@@ -111,33 +141,182 @@ public sealed class REPOrt : BaseUnityPlugin
             else frozen.Clear();
         }
     }
-    void LateUpdate() { if(PlayerAvatar.instance && Camera.main && fov.Value>0) Camera.main.fieldOfView = Mathf.Clamp(fov.Value,40,140); }
+    void LateUpdate() { if(open) { Cursor.lockState=CursorLockMode.None; Cursor.visible=true; } if(PlayerAvatar.instance && Camera.main && fov.Value>0) Camera.main.fieldOfView = Mathf.Clamp(fov.Value,40,140); }
     string Caption(Component c) { var p=c as PlayerAvatar; return p ? SemiFunc.PlayerGetName(p) : c.name.Replace("(Clone)","").Trim(); }
     void OnGUI()
     {
-        float s = Mathf.Min(scale.Value,Screen.width/450f,Screen.height/500f);
+        float s = Mathf.Min(scale.Value,Screen.width/544f,Screen.height/524f);
         var previous=GUI.matrix;
-        GUI.matrix=Matrix4x4.Scale(new Vector3(s,s,1));
         try {
-            var cam=Camera.main;
-            if(Event.current.type==EventType.Repaint && cam && On("Toggle ESP")) {
-                for(int i=0;i<kinds.Length;i++) if(On(kinds[i]+" ESP"))
-                    foreach(var c in objects[i]) {
-                        if(!c || c==PlayerAvatar.instance) continue;
-                        var pos=cam.WorldToScreenPoint(c.transform.position);
-                        if(pos.z<=0) continue;
-                        GUI.Label(new Rect(pos.x/s,(Screen.height-pos.y)/s,280,24),Caption(c));
-                    }
+            GUI.matrix=Matrix4x4.identity;
+            if(Event.current.type==EventType.Repaint && On("Toggle ESP")) DrawEsp();
+            if(open) {
+                GUI.matrix=Matrix4x4.Scale(new Vector3(s,s,1));
+                InitTheme();
+                window.x=Mathf.Clamp(window.x,0,Mathf.Max(0,Screen.width/s-window.width));
+                window.y=Mathf.Clamp(window.y,0,Mathf.Max(0,Screen.height/s-window.height));
+                window=GUILayout.Window(GetInstanceID(),window,Draw,"",panel);
+                if(Event.current.isMouse || Event.current.type==EventType.ScrollWheel) Event.current.Use();
             }
-            if(open) window=GUILayout.Window(GetInstanceID(),window,Draw,"REPOrt   ·   F8");
         } finally { GUI.matrix=previous; }
     }
-    void Toggle(string key) { flags[key].Value=GUILayout.Toggle(On(key),key); }
-    bool Button(string text) { return GUILayout.Button(text); }
+    readonly Dictionary<Enemy,Renderer[]> enemyMeshes=new Dictionary<Enemy,Renderer[]>();
+    readonly Color[] markerColors={
+        new Color32(89,205,255,255), new Color32(255,99,104,255), new Color32(255,211,92,255),
+        new Color32(90,226,184,255), new Color32(188,151,255,255), new Color32(255,148,212,255),
+        new Color32(255,166,83,255)
+    };
+    static readonly FieldInfo currentValue=Field(typeof(ValuableObject),"dollarValueCurrent"),
+        valueReady=Field(typeof(ValuableObject),"dollarValueSet"), shop=Field(typeof(ItemAttributes),"shopItem"),
+        shopPrice=Field(typeof(ItemAttributes),"value"), itemName=Field(typeof(ItemAttributes),"itemName");
+    GUIStyle marker;
+    string ItemLabel(Component c)
+    {
+        var item=c.GetComponent<ItemAttributes>();
+        var valuable=c.GetComponent<ValuableObject>();
+        string name=item ? itemName.GetValue(item) as string : null;
+        if(string.IsNullOrEmpty(name)) name=Caption(c);
+        int price;
+        if(valuable && (bool)valueReady.GetValue(valuable)) price=Mathf.RoundToInt((float)currentValue.GetValue(valuable));
+        else if(item && (bool)shop.GetValue(item)) price=(int)shopPrice.GetValue(item);
+        else return name;
+        return name+"\n$"+price.ToString("N0");
+    }
+    // Viewport coordinates stay normalized even when the scene is rendered to a smaller texture.
+    static Vector2 ScreenPoint(Vector3 viewport,Rect area)
+    {
+        return new Vector2(area.x+viewport.x*area.width,area.y+(1f-viewport.y)*area.height);
+    }
+    bool EnemyRect(Enemy enemy,Camera cam,Rect area,out Rect box)
+    {
+        box=new Rect();
+        Renderer[] meshes;
+        if(!enemyMeshes.TryGetValue(enemy,out meshes)) return false;
+        Bounds bounds=new Bounds();
+        bool found=false;
+        foreach(var r in meshes) {
+            if(!r || !r.enabled || !r.gameObject.activeInHierarchy || !(r is MeshRenderer || r is SkinnedMeshRenderer)) continue;
+            if(found) bounds.Encapsulate(r.bounds); else bounds=r.bounds;
+            found=true;
+        }
+        if(!found || bounds.Contains(cam.transform.position)) return false;
+        var low=new Vector2(float.PositiveInfinity,float.PositiveInfinity);
+        var high=new Vector2(float.NegativeInfinity,float.NegativeInfinity);
+        for(int i=0;i<8;i++) {
+            Vector3 corner=new Vector3((i&1)==0?bounds.min.x:bounds.max.x,(i&2)==0?bounds.min.y:bounds.max.y,(i&4)==0?bounds.min.z:bounds.max.z);
+            Vector3 viewport=cam.WorldToViewportPoint(corner);
+            if(viewport.z<cam.nearClipPlane) return false;
+            Vector2 p=ScreenPoint(viewport,area);
+            low=Vector2.Min(low,p);
+            high=Vector2.Max(high,p);
+        }
+        low=Vector2.Max(low,area.min);
+        high=Vector2.Min(high,area.max);
+        box=Rect.MinMaxRect(low.x,low.y,high.x,high.y);
+        return box.width>=2 && box.height>=2;
+    }
+    static void Paint(Rect rect,Color color)
+    {
+        GUI.color=color;
+        GUI.DrawTexture(rect,Texture2D.whiteTexture);
+    }
+    void DrawEsp()
+    {
+        var cam=GameDirector.instance ? SemiFunc.MainCamera() : Camera.main;
+        if(!cam) return;
+        Rect v=cam.targetTexture ? new Rect(0,0,1,1) : cam.rect;
+        Rect area=new Rect(v.x*Screen.width,(1-v.yMax)*Screen.height,v.width*Screen.width,v.height*Screen.height);
+        if(marker==null) marker=new GUIStyle(GUI.skin.label){alignment=TextAnchor.MiddleCenter,fontStyle=FontStyle.Bold,padding=new RectOffset()};
+        marker.fontSize=Mathf.RoundToInt(14*scale.Value);
+        Color previous=GUI.color;
+        try {
+            for(int i=0;i<kinds.Length;i++) {
+                if(!On(kinds[i]+" ESP")) continue;
+                Color color=markerColors[i];
+                foreach(var c in objects[i]) {
+                    if(!c || !c.gameObject.activeInHierarchy || c==PlayerAvatar.instance) continue;
+                    var enemy=c as Enemy;
+                    Vector3 anchor=enemy && enemy.CenterTransform ? enemy.CenterTransform.position : c.transform.position;
+                    Vector3 viewport=cam.WorldToViewportPoint(anchor);
+                    if(viewport.z<cam.nearClipPlane) continue;
+                    Vector2 point=ScreenPoint(viewport,area);
+                    Rect box;
+                    if(enemy && EnemyRect(enemy,cam,area,out box)) {
+                        Paint(new Rect(box.x,box.y,box.width,2),color);
+                        Paint(new Rect(box.x,box.yMax-2,box.width,2),color);
+                        Paint(new Rect(box.x,box.y,2,box.height),color);
+                        Paint(new Rect(box.xMax-2,box.y,2,box.height),color);
+                        point=new Vector2(box.center.x,box.yMin);
+                    } else if(!area.Contains(point)) continue;
+                    string label=i==2 ? ItemLabel(c) : Caption(c);
+                    var size=marker.CalcSize(new GUIContent(label))+new Vector2(10,4);
+                    Rect badge=new Rect(Mathf.Clamp(point.x-size.x/2,area.xMin,area.xMax-size.x),
+                        Mathf.Max(area.yMin,point.y-size.y-3),size.x,size.y);
+                    Paint(badge,new Color(0.035f,0.05f,0.065f,0.85f));
+                    GUI.color=Color.white;
+                    marker.normal.textColor=color;
+                    GUI.Label(badge,label,marker);
+                }
+            }
+        } finally { GUI.color=previous; }
+    }
+    readonly List<Texture2D> palette = new List<Texture2D>();
+    GUIStyle panel, action, selectedAction, title;
+    readonly string[] tabs = {"Settings","Self Cheats","Visuals","Player","Enemy"};
+
+    Texture2D Fill(byte r,byte g,byte b)
+    {
+        var texture=new Texture2D(1,1);
+        texture.SetPixel(0,0,new Color32(r,g,b,255));
+        texture.Apply();
+        palette.Add(texture);
+        return texture;
+    }
+    void InitTheme()
+    {
+        if(panel!=null) return;
+        panel=new GUIStyle(GUI.skin.box);
+        panel.normal.background=Fill(20,29,38);
+        panel.padding=new RectOffset(16,16,12,12);
+        action=new GUIStyle(GUI.skin.button);
+        action.fixedHeight=30;
+        action.border=new RectOffset();
+        action.normal.background=Fill(44,60,73);
+        action.hover.background=Fill(62,83,96);
+        action.active.background=Fill(35,111,106);
+        action.normal.textColor=action.hover.textColor=action.active.textColor=Color.white;
+        selectedAction=new GUIStyle(action);
+        selectedAction.normal.background=Fill(29,103,99);
+        title=new GUIStyle(GUI.skin.label);
+        title.fontSize=24;
+        title.fontStyle=FontStyle.Bold;
+        title.normal.textColor=new Color32(118,230,202,255);
+    }
+    void Toggle(string key)
+    {
+        bool enabled=On(key);
+        if(GUILayout.Button((enabled?"●   ":"○   ")+key,enabled?selectedAction:action))
+            flags[key].Value=!enabled;
+    }
+    bool Button(string text) { return GUILayout.Button(text,action); }
     void Draw(int id)
     {
-        int selected=GUILayout.Toolbar(tab,new[]{"Settings","Self Cheats","Visuals","Player","Enemy"});
-        if(selected!=tab) { tab=selected; scroll=Vector2.zero; status=""; }
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("REPOrt",title);
+        GUILayout.FlexibleSpace();
+        if(GUILayout.Button("Fermer  ·  F8",action,GUILayout.Width(110))) SetOpen(false);
+        GUILayout.EndHorizontal();
+        GUILayout.Space(8);
+        GUILayout.BeginHorizontal();
+        for(int i=0;i<tabs.Length;i++) {
+            if(GUILayout.Button(tabs[i],i==tab?selectedAction:action) && i!=tab) {
+                tab=i;
+                scroll=Vector2.zero;
+                status="";
+            }
+        }
+        GUILayout.EndHorizontal();
+        GUILayout.Space(10);
         scroll=GUILayout.BeginScrollView(scroll);
         try {
             if(tab==0) {
@@ -169,7 +348,7 @@ public sealed class REPOrt : BaseUnityPlugin
             if(On("Debug Mode")) Logger.LogError(ex);
         } finally { GUI.enabled=true; GUILayout.EndScrollView(); }
         GUILayout.Label(status);
-        GUI.DragWindow(new Rect(0,0,440,20));
+        GUI.DragWindow(new Rect(0,0,350,45));
     }
     void Slider(ConfigEntry<int> entry,string label,int max)
     {
